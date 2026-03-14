@@ -22,6 +22,7 @@ import {
 import { LyricSource } from '/@/shared/types/domain-types';
 import { LyricsResponse } from '/@/shared/types/domain-types';
 import { ServerFeature } from '/@/shared/types/features-types';
+import { isTTML, parseTTML } from '/@/main/features/core/lyrics/ttml'; // ← NEW
 
 const lyricsIpc = isElectron() ? window.api.lyrics : null;
 
@@ -45,7 +46,20 @@ const timeExp = /\[(\d{2,}):(\d{2})(?:\.(\d{2,3}))?]([^\n]+)(\n|$)/g;
 // [SSS,???] text
 const alternateTimeExp = /\[(\d*),(\d*)]([^\n]+)(\n|$)/g;
 
-const formatLyrics = (lyrics: string) => {
+const formatLyrics = (lyrics: string): LyricsResponse => {
+    // ── Apple TTML detection ─────────────────────────────────────────────────
+    // Triggered when a FLAC file's LYRICS vorbis comment (or an M4A lyric atom)
+    // contains raw Apple TTML XML. Navidrome passes it through unchanged as
+    // song.lyrics; the structured-lyrics path (getLyricsBySongId) returns
+    // pre-parsed JSON and never reaches this function.
+    if (isTTML(lyrics)) {                           // ← NEW
+        const parsed = parseTTML(lyrics);           // ← NEW
+        if (parsed) return parsed;                  // ← NEW
+        // parseTTML returned null → no timed <p> elements found;
+        // fall through so the raw text is returned as unsynchronised lyrics.
+    }
+
+    // ── LRC (line-by-line) ───────────────────────────────────────────────────
     const synchronizedLines = lyrics.matchAll(timeExp);
     const formattedLyrics: SynchronizedLyricsArray = [];
 
@@ -62,6 +76,7 @@ const formatLyrics = (lyrics: string) => {
 
     if (formattedLyrics.length > 0) return formattedLyrics;
 
+    // ── NetEase karaoke format ───────────────────────────────────────────────
     const alternateSynchronizedLines = lyrics.matchAll(alternateTimeExp);
     for (const line of alternateSynchronizedLines) {
         const [, timeInMilis, , text] = line;
@@ -93,7 +108,6 @@ export function computeSelectedFromResult(
 } {
     const { local, overrideData, overrideSelection, remoteAuto, selectedOffsetMs } = result;
 
-    // Override takes precedence over local and remote lyrics in all scenarios if available
     if (overrideSelection && overrideData) {
         const overrideLyrics: FullLyricsMetadata = {
             artist: overrideSelection.artist,
@@ -113,19 +127,16 @@ export function computeSelectedFromResult(
         (Array.isArray(local) && local.length > 0) ||
         (local != null && !Array.isArray(local) && 'lyrics' in local && Boolean(local.lyrics));
 
-    // If setting is set to prefer local lyrics, return the local lyrics if available
     if (preferLocalLyrics && hasLocalLocal) {
         if (Array.isArray(local) && local.length > 0) {
             const item = local[Math.min(selectedStructuredIndex, local.length - 1)];
             return { selected: item, selectedSynced: item.synced };
         }
-
         if (local != null && !Array.isArray(local) && 'lyrics' in local && local.lyrics) {
             return { selected: local, selectedSynced: Array.isArray(local.lyrics) };
         }
     }
 
-    // If remote lyrics are automatically fetched and available, return the remote auto lyrics
     if (remoteAuto) {
         return {
             selected: remoteAuto,
@@ -133,7 +144,6 @@ export function computeSelectedFromResult(
         };
     }
 
-    // Otherwise, we just return the local lyrics if available, using structured lyrics if available
     if (Array.isArray(local) && local.length > 0) {
         const item = local[Math.min(selectedStructuredIndex, local.length - 1)];
         return { selected: item, selectedSynced: item.synced };
@@ -143,7 +153,6 @@ export function computeSelectedFromResult(
         return { selected: local, selectedSynced: Array.isArray(local.lyrics) };
     }
 
-    // If no lyrics are available, return null
     return { selected: null, selectedSynced: false };
 }
 
@@ -157,6 +166,8 @@ export async function fetchLocalLyrics(params: {
     if (!server) throw new Error('Server not found');
 
     if (hasFeature(server, ServerFeature.LYRICS_MULTIPLE_STRUCTURED)) {
+        // Navidrome / OpenSubsonic — returns pre-parsed StructuredLyric[] JSON
+        // with millisecond timestamps. Raw TTML never appears on this path.
         const subsonicLyrics = await api.controller
             .getStructuredLyrics({
                 apiClientProps: { serverId, signal },
@@ -181,6 +192,9 @@ export async function fetchLocalLyrics(params: {
             };
         }
     } else if (song.lyrics) {
+        // Raw embedded tag from the audio file (FLAC LYRICS vorbis comment,
+        // M4A lyric atom). May contain Apple TTML XML — formatLyrics() handles
+        // detection and parsing before the LRC / plain-text fallback.
         return {
             artist: song.artists?.[0]?.name,
             lyrics: formatLyrics(song.lyrics),
@@ -277,16 +291,13 @@ export const lyricsQueries = {
                 const selectedOffsetMs = prev?.selectedOffsetMs ?? 0;
                 const preferLocalLyrics = useSettingsStore.getState().lyrics.preferLocalLyrics;
 
-                // Fetch local lyrics
                 const localPromise = fetchLocalLyrics({ serverId: args.serverId, signal, song });
 
-                // Fetch remote auto lyrics
                 const remoteAutoPromise =
                     suppressRemoteAuto || !useSettingsStore.getState().lyrics.fetch
                         ? null
                         : fetchRemoteLyricsAuto(song);
 
-                // Fetch override data
                 const overrideDataPromise = overrideSelection
                     ? fetchRemoteLyricsById({
                           remoteSongId: overrideSelection.id,
@@ -326,13 +337,12 @@ export const lyricsQueries = {
                     selectedStructuredIndex,
                     local,
                 );
-                const resultSelectedOffsetMs = displayOffset;
 
                 return {
                     ...emptyResult(),
                     ...partial,
                     selected,
-                    selectedOffsetMs: resultSelectedOffsetMs,
+                    selectedOffsetMs: displayOffset,
                     selectedStructuredIndex,
                     selectedSynced,
                     suppressRemoteAuto,
