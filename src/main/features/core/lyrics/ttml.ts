@@ -153,11 +153,12 @@ function parseXml(xmlString: string): Document | null {
             }
             return doc;
         }
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { DOMParser: NodeDOMParser } = require(/* @vite-ignore */ '@xmldom/xmldom') as {
-            DOMParser: typeof DOMParser;
-        };
-        return new NodeDOMParser().parseFromString(xmlString, 'application/xml');
+        // Main-process fallback. Cast to `any` because `typeof DOMParser` is
+        // `never` in tsconfig.node.json (no DOM lib), which made the previous
+        // typed cast produce a non-constructable `never` type.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-explicit-any
+        const xmldom = require(/* @vite-ignore */ '@xmldom/xmldom') as any;
+        return new xmldom.DOMParser().parseFromString(xmlString, 'application/xml') as Document;
     } catch (err) {
         console.error('[TTML] Failed to parse XML:', err);
         return null;
